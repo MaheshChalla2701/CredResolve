@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smartdialer"
+version = "0.1.0"
+description = "SmartDialer — Progressive + Predictive outbound dialing prototype"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    # Database
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14.0",
+    "psycopg[binary]>=3.2.3",
+    "asyncpg>=0.30.0",
+    # Validation & config
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.6.0",
+    # Utilities
+    "python-dotenv>=1.0.1",
+    "structlog>=24.4.0",
+    "prometheus-client>=0.21.0",
+    "httpx>=0.28.0",
+    "anyio>=4.7.0",
+    "tenacity>=9.0.0",
+    "python-ulid>=3.0.0",
+    "tabulate>=0.9.0",
+    "aiosqlite>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-timeout>=2.3.1",
+    "hypothesis>=6.122.0",
+    "faker>=33.1.0",
+    "coverage>=7.6.0",
+    "pytest-cov>=6.0.0",
+    "locust>=2.32.0",
+    "httpx>=0.28.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+timeout = 60
+markers = [
+    "slow: marks tests as slow",
+    "concurrency: marks tests requiring real PostgreSQL concurrency",
+    "integration: marks tests requiring a running database",
+    "simulation: marks simulation tests",
+]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/simulation/*", "*/migrations/*"]

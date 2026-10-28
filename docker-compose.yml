@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: smartdialer
+      POSTGRES_PASSWORD: smartdialer_dev
+      POSTGRES_DB: smartdialer
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartdialer -d smartdialer"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres_test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: smartdialer_test
+      POSTGRES_PASSWORD: smartdialer_test
+      POSTGRES_DB: smartdialer_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartdialer_test -d smartdialer_test"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
