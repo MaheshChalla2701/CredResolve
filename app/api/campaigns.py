@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.persistence.database import get_async_db
 from app.persistence.models import Campaign
 from app.persistence.repositories import CampaignRepository
+from app.workers.runtime import DialerRuntime, get_runtime
 
 router = APIRouter()
 
@@ -109,13 +110,21 @@ async def run_dialing_cycle(
     campaign_id: str,
     provider_id: str = "mock_provider_a",
     session: AsyncSession = Depends(get_db),
+    runtime: DialerRuntime = Depends(get_runtime),
 ):
-    """Run one dialing cycle for the campaign using its configured mode."""
-    from app.services.call_allocator import CallAllocator
-    from app.services.safety_controller import SafetyController
-    from app.services.progressive_dialer import ProgressiveDialer
-    from app.persistence.repositories import CampaignRepository
+    """Run one dialing cycle for the campaign using its configured dialing mode.
 
+    Calls are reserved and queued in the dispatch outbox here; the background
+    dispatch worker contacts the (mock) provider afterwards. Poll
+    GET /api/v1/calls/{id} to follow each call.
+    """
+    from app.services.dialing import run_dialing_cycle as dial_campaign
+
+    if provider_id not in runtime.providers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider_id {provider_id!r}; available: {sorted(runtime.providers)}",
+        )
     repo = CampaignRepository(session)
     c = await repo.get(campaign_id)
     if c is None:
@@ -123,22 +132,47 @@ async def run_dialing_cycle(
     if c.status != "ACTIVE":
         raise HTTPException(status_code=400, detail="Campaign must be ACTIVE to dial")
 
-    safety = SafetyController()
-    allocator = CallAllocator(provider_id=provider_id)
-    dialer = ProgressiveDialer(safety, allocator)
-
-    calls, decision = await dialer.run_cycle(
-        session, campaign_id, provider_id
+    result = await dial_campaign(
+        session,
+        c,
+        provider_id=provider_id,
+        safety=runtime.safety_controller(),
+        health_service=runtime.health[provider_id],
     )
+    # Commit before waking the worker so it can see the new outbox records.
+    await session.commit()
+    if result.calls:
+        runtime.notify_dispatch()
 
+    decision = result.decision
+    rec = result.recommendation
     return {
         "campaign_id": campaign_id,
-        "calls_allocated": len(calls),
-        "call_ids": [c.id for c in calls],
+        "dialing_mode": result.mode,
+        "calls_allocated": len(result.calls),
+        "call_ids": [call.id for call in result.calls],
+        # Reserved and queued — not yet placed with the provider.
+        "call_state": "RESERVED" if result.calls else None,
+        "dispatch_status": "PENDING" if result.calls else None,
+        "dispatch_worker_running": runtime.running,
         "safety_decision": {
+            "decision_id": decision.decision_id,
             "decision": decision.decision,
+            "requested_count": decision.requested_count,
             "approved_count": decision.approved_count,
+            "allocated_count": len(result.calls),
             "reason_codes": decision.reason_codes,
+            # False when nothing was proposed and the Safety Controller was not consulted.
+            "audited": decision.persisted,
+        },
+        "pacing": None if rec is None else {
+            "recommended_count": rec.recommended_count,
+            "answer_rate_estimate": round(rec.answer_rate_estimate, 4),
+            "answer_rate_confidence": rec.answer_rate_confidence,
+            "available_agents": rec.available_agents,
+            "outstanding_calls": rec.outstanding_calls,
+            "provider_health_factor": rec.provider_health_factor,
+            "notes": rec.calculation_notes,
         },
     }
 
@@ -158,6 +192,9 @@ async def get_safety_decisions(
             "decision": d.decision,
             "requested": d.requested_count,
             "approved": d.approved_count,
+            # None when nothing was approved (no allocation attempted), or for
+            # records written before allocation tracking existed.
+            "allocated": (d.capacity_snapshot or {}).get("allocated_count"),
             "reasons": d.reason_codes,
             "decided_at": d.decided_at.isoformat(),
         }

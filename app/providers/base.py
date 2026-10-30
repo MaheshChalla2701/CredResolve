@@ -79,6 +79,17 @@ class ProviderAdapter(ABC):
     async def get_call_status(self, provider_call_id: str) -> ProviderEvent | None:
         """Retrieve current status for a given provider call ID."""
 
+    async def find_call_by_idempotency_key(self, idempotency_key: str) -> str | None:
+        """Return the provider_call_id already created for this idempotency key, or
+        None if the provider never accepted it. Reconciliation uses this to resolve
+        dispatches whose outcome is unknown (e.g. a timeout). Adapters that cannot
+        answer raise NotImplementedError and the call stays ambiguous."""
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Release background resources (called on application shutdown)."""
+        return None
+
     @abstractmethod
     async def cancel_call(self, provider_call_id: str) -> bool:
         """Request cancellation. Returns True if cancellation was accepted."""

@@ -8,25 +8,38 @@ IMPORTANT BOUNDARY:
 
 Pacing algorithm (rule-based, not ML):
 
-  1. Maintain a rolling EWMA answer-rate estimate (configurable alpha).
+  1. Maintain a rolling EWMA answer-rate estimate (configurable alpha),
+     rebuilt from the campaign's recent finished calls (refresh_answer_rate).
      Prior: Beta(2, 2) — weakly informative, avoids degenerate estimates.
 
-  2. Count outstanding unconnected calls (initiated + ringing + answered).
-     Each represents a call that *may* answer.
+  2. Count outstanding unconnected calls (reserved + initiated + ringing +
+     answered). In the strict reservation model each one already holds its
+     own RESERVED/DIALING agent, so its answer cannot take an AVAILABLE agent.
+     Only outstanding calls beyond those agents ("unbacked") compete for the
+     available agents:
+       unbacked = max(0, outstanding - (reserved + dialing agents))
+       expected_from_outstanding = unbacked * answer_rate_estimate
 
-  3. Estimate expected answers from outstanding calls:
-       expected_from_outstanding = outstanding_calls * answer_rate_estimate
+  3. Count verified available agents (from DB).
 
-  4. Count verified available agents (from DB).
+  4. Desired calls = those needed to achieve utilization_target of the
+     available agents, minus expected answers that will claim them:
+       answers_needed = available * utilization_target - expected_from_outstanding
+       raw_dials      = answers_needed / answer_rate_estimate
 
-  5. Desired calls = those needed to achieve utilization_target of agents,
-     minus expected answers already in flight:
-       desired_new = ceil(available * utilization_target) - expected_from_outstanding
+  5. Conservative adjustment: if the estimate has LOW confidence, halve the
+     proposal. If provider health is degraded, scale by the health factor.
 
-  6. Conservative adjustment: if answer_rate is low/uncertain, reduce proposal.
-     If provider health is degraded, apply additional reduction factor.
+  6. Clamp to [0, available_agents] and to the campaign's concurrency
+     headroom, then submit to the Safety Controller.
 
-  7. Clamp to [0, available_agents] and submit to Safety Controller.
+Not used — and why: call durations and setup latency. Every call reserves an
+AVAILABLE agent before it is dialed (CallAllocator), so the pacer can only
+choose how many of the currently free agents to use. Durations and setup
+latency matter when dialing ahead for agents that will free up soon, which
+needs calls placed without a reserved agent (and abandonment handling); this
+design deliberately does not allow that, and the Safety Controller's strict
+mode would reject it. pacer_lookahead_seconds is therefore not applied.
 
 Why the Safety Controller must still approve:
   - The estimate is probabilistic. It can be wrong (especially for sudden
@@ -153,6 +166,38 @@ class PredictivePacingEngine:
             else _settings.pacer_utilization_target
         )
 
+    async def refresh_answer_rate(
+        self, session: "AsyncSession", campaign_id: str, *, window: int = 100
+    ) -> int:
+        """Rebuild the answer-rate estimate from the campaign's most recent finished
+        calls that the provider actually placed (oldest first, so the EWMA weights
+        recent outcomes most). Returns the number of outcomes observed."""
+        from sqlalchemy import select
+        from app.core.enums import TERMINAL_CALL_STATES
+        from app.persistence.models import Call
+
+        result = await session.execute(
+            select(Call.answered_at, Call.state)
+            .where(
+                Call.campaign_id == campaign_id,
+                Call.state.in_(list(TERMINAL_CALL_STATES)),
+                Call.provider_call_id.is_not(None),
+            )
+            .order_by(Call.completed_at.desc())
+            .limit(window)
+        )
+        outcomes = [
+            answered_at is not None or state == CallState.COMPLETED
+            for answered_at, state in result.all()
+        ]
+        self.estimator = AnswerRateEstimator(
+            smoothing_alpha=self.estimator.alpha,
+            min_samples=self.estimator.min_samples,
+        )
+        for answered in reversed(outcomes):
+            self.estimator.observe(answered)
+        return len(outcomes)
+
     async def recommend(
         self,
         session: "AsyncSession",
@@ -201,10 +246,12 @@ class PredictivePacingEngine:
 
         notes = []
 
-        # Expected answers from outstanding calls
-        expected_from_outstanding = outstanding * answer_rate
+        # Expected answers from outstanding calls that would need one of the
+        # available agents (calls without their own RESERVED/DIALING agent).
+        unbacked = max(0, outstanding - (reserved + dialing))
+        expected_from_outstanding = unbacked * answer_rate
         notes.append(
-            f"outstanding={outstanding} × answer_rate={answer_rate:.3f} "
+            f"outstanding={outstanding} (unbacked={unbacked}) × answer_rate={answer_rate:.3f} "
             f"= expected_outstanding_answers={expected_from_outstanding:.2f}"
         )
 
@@ -212,8 +259,9 @@ class PredictivePacingEngine:
         target_connected = available * self.utilization_target
         notes.append(f"target_connected={target_connected:.2f} (target={self.utilization_target})")
 
-        # Additional answers we need to start now to reach target
-        answers_needed = max(0.0, target_connected - expected_from_outstanding - connected)
+        # Additional answers we need to start now to reach target. Agents already
+        # CONNECTED are not in `available`, so they are not subtracted here.
+        answers_needed = max(0.0, target_connected - expected_from_outstanding)
         notes.append(f"answers_needed={answers_needed:.2f}")
 
         # How many new dials to generate `answers_needed` answers
@@ -277,6 +325,8 @@ class PredictivePacingEngine:
             confidence=confidence,
             outstanding=outstanding,
             available=available,
+            connected=connected,
+            wrap_up=wrap_up,
             notes=notes,
         )
 

@@ -33,8 +33,14 @@ ENV/
 htmlcov/
 .hypothesis/
 
+# Local settings (copied from .env.example)
+.env
+
 # Database files
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 simulation.db

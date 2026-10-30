@@ -119,9 +119,10 @@ VALID_AGENT_TRANSITIONS: frozenset[tuple[AgentState, AgentState]] = frozenset({
     (AgentState.AVAILABLE, AgentState.PAUSED),
     (AgentState.AVAILABLE, AgentState.OFFLINE),
     (AgentState.RESERVED, AgentState.DIALING),
-    (AgentState.RESERVED, AgentState.AVAILABLE),   # safe pre-initiation rollback only
+    (AgentState.RESERVED, AgentState.AVAILABLE),   # call ended without being answered
     (AgentState.DIALING, AgentState.CONNECTED),
-    (AgentState.DIALING, AgentState.WRAP_UP),       # call failed/completed without answer
+    (AgentState.DIALING, AgentState.AVAILABLE),     # call ended without being answered
+    (AgentState.DIALING, AgentState.WRAP_UP),       # call ended after the borrower answered
     (AgentState.CONNECTED, AgentState.WRAP_UP),
     (AgentState.WRAP_UP, AgentState.AVAILABLE),
     (AgentState.PAUSED, AgentState.AVAILABLE),

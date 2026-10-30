@@ -36,6 +36,10 @@ class DuplicateAllocationError(AllocationError):
     """A duplicate allocation was attempted and rejected."""
 
 
+class CampaignConcurrencyLimitError(AllocationError):
+    """The campaign already has max_concurrent_calls active calls."""
+
+
 class SafetyViolationError(SmartDialerError):
     """An operation was blocked by the Safety Controller."""
 

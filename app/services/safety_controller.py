@@ -17,6 +17,14 @@ Safety checks performed before approving each batch:
   5. Provider circuit breaker must not be OPEN.
   6. In strict mode: every approved call needs a reserved agent slot.
   7. No approval if we cannot read fresh state.
+  8. No approval that cannot be audited: if the decision record cannot be
+     written, the request is rejected.
+
+The decision is made under the campaign lock taken by the dialing cycle (see
+CampaignRepository.lock_for_dialing), so concurrent cycles see each other's
+allocations. After allocation the dialer calls record_allocation(), which
+stores how many calls were actually reserved (capacity_snapshot
+["allocated_count"]) and, if fewer than approved, an ALLOCATION_SHORTFALL reason.
 """
 from __future__ import annotations
 
@@ -49,6 +57,10 @@ class SafetyDecisionResult:
     capacity_snapshot: dict = field(default_factory=dict)
     provider_health_snapshot: dict = field(default_factory=dict)
     decided_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Set by record_allocation(); None until the dialer has allocated.
+    allocated_count: int | None = None
+    # True once the decision is in the safety_decisions audit table.
+    persisted: bool = False
 
 
 class SafetyController:
@@ -119,8 +131,19 @@ class SafetyController:
             result.decision = SafetyDecision.REJECT
             result.reason_codes.append(f"INTERNAL_ERROR:{type(exc).__name__}")
 
-        # Persist decision record
-        await self._persist_decision(session, result)
+        # Persist decision record — an approval that cannot be audited is not given.
+        try:
+            await self._persist_decision(session, result)
+        except Exception as exc:
+            logger.error(
+                "safety_decision_persist_failed",
+                campaign_id=campaign_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            result.approved_count = 0
+            result.decision = SafetyDecision.REJECT
+            result.reason_codes.append(f"AUDIT_PERSIST_FAILED:{type(exc).__name__}")
 
         # Update metrics
         sd_metric.labels(
@@ -198,6 +221,7 @@ class SafetyController:
             return 0
 
         # ── Check 5: Provider circuit breaker ─────────────────────────────
+        probe_limit: int | None = None
         health_service = self._health.get(provider_id)
         if health_service:
             health_snap = await health_service.get_snapshot(session)
@@ -205,6 +229,9 @@ class SafetyController:
             if health_snap.get("circuit_state") == "OPEN":
                 result.reason_codes.append("CIRCUIT_BREAKER_OPEN")
                 return 0
+            if health_snap.get("circuit_state") == "HALF_OPEN":
+                # Recovering provider: allow only a few probe calls.
+                probe_limit = max(1, _settings.circuit_breaker_half_open_probes)
         else:
             result.provider_health_snapshot = {"provider_id": provider_id, "status": "unknown"}
 
@@ -229,6 +256,9 @@ class SafetyController:
             return 0
 
         approved = min(requested_count, concurrency_headroom, max_by_agents)
+        if probe_limit is not None and approved > probe_limit:
+            approved = probe_limit
+            result.reason_codes.append("CIRCUIT_HALF_OPEN_PROBE_LIMIT")
 
         if approved <= 0:
             result.reason_codes.append("APPROVED_COUNT_ZERO_AFTER_LIMITS")
@@ -239,27 +269,66 @@ class SafetyController:
 
         return approved
 
+    async def record_allocation(
+        self,
+        session: "AsyncSession",
+        result: SafetyDecisionResult,
+        *,
+        allocated: int,
+        stop_reason: str | None = None,
+    ) -> None:
+        """Record on the decision how many calls were actually allocated.
+
+        Allocation can fall short of the approval (an agent paused, or a
+        borrower changed, after the decision). The approved count is left as
+        decided; the shortfall and its cause are added to the audit record.
+        """
+        if allocated > result.approved_count:
+            raise SafetyViolationError(
+                f"{allocated} calls allocated against an approval of {result.approved_count} "
+                f"(decision {result.decision_id})"
+            )
+        result.allocated_count = allocated
+        if allocated < result.approved_count:
+            result.reason_codes.append(f"ALLOCATION_SHORTFALL:{stop_reason or 'UNKNOWN'}")
+            logger.warning(
+                "safety_allocation_shortfall",
+                campaign_id=result.campaign_id,
+                decision_id=result.decision_id,
+                approved=result.approved_count,
+                allocated=allocated,
+                reason=stop_reason,
+            )
+        if not result.persisted:
+            return
+        from app.persistence.models import SafetyDecisionRecord
+
+        record = await session.get(SafetyDecisionRecord, result.decision_id)
+        if record is None:
+            raise SafetyViolationError(f"Safety decision {result.decision_id} is missing from the audit log")
+        # JSON columns are not mutation-tracked: assign new objects.
+        record.capacity_snapshot = {**(record.capacity_snapshot or {}), "allocated_count": allocated}
+        record.reason_codes = list(result.reason_codes)
+        await session.flush()
+
     async def _persist_decision(
         self, session: "AsyncSession | None", result: SafetyDecisionResult
     ) -> None:
         if session is None:
             return
-        try:
-            from app.persistence.models import SafetyDecisionRecord
-            from app.persistence.repositories import SafetyDecisionRepository
+        from app.persistence.models import SafetyDecisionRecord
+        from app.persistence.repositories import SafetyDecisionRepository
 
-            record = SafetyDecisionRecord(
-                id=result.decision_id,
-                campaign_id=result.campaign_id,
-                requested_count=result.requested_count,
-                approved_count=result.approved_count,
-                decision=result.decision,
-                reason_codes=result.reason_codes,
-                capacity_snapshot=result.capacity_snapshot,
-                provider_health_snapshot=result.provider_health_snapshot,
-                decided_at=result.decided_at,
-            )
-            repo = SafetyDecisionRepository(session)
-            await repo.create(record)
-        except Exception as exc:
-            logger.warning("safety_decision_persist_failed", error=str(exc))
+        record = SafetyDecisionRecord(
+            id=result.decision_id,
+            campaign_id=result.campaign_id,
+            requested_count=result.requested_count,
+            approved_count=result.approved_count,
+            decision=result.decision,
+            reason_codes=list(result.reason_codes),
+            capacity_snapshot=dict(result.capacity_snapshot),
+            provider_health_snapshot=result.provider_health_snapshot,
+            decided_at=result.decided_at,
+        )
+        await SafetyDecisionRepository(session).create(record)
+        result.persisted = True

@@ -63,8 +63,29 @@ class Settings(BaseSettings):
     circuit_breaker_half_open_probes: int = 2
 
     # Reconciliation
-    reconciliation_interval_seconds: int = 15
+    reconciliation_interval_seconds: float = 15
     dispatch_lease_seconds: int = 30
+    # Active calls with no state change for this long are probed at the provider
+    stale_call_seconds: int = 300
+
+    # Background runtime (dispatch worker, provider event consumers, reconciliation)
+    # started inside the API process. Disable to run the API without workers.
+    background_workers_enabled: bool = True
+    dispatch_poll_interval_seconds: float = 0.5
+    event_max_retries: int = 3
+    # Events whose provider_call_id is not yet recorded are retried until this age
+    unmatched_event_max_age_seconds: int = 120
+
+    # Provider webhook authentication (app/api/webhook_auth.py). JSON object
+    # {"provider_id": "shared secret"}. Empty: webhooks are accepted without
+    # authentication in development/test and refused in production.
+    provider_webhook_secrets: dict[str, str] = Field(default_factory=dict)
+    provider_webhook_max_skew_seconds: int = 300
+
+    # Mock providers (the only providers wired in — no real telephony)
+    mock_provider_seed: int | None = None
+    # Multiplier on simulated provider delays (1.0 = realistic, 0.01 = fast tests)
+    mock_provider_delay_scale: float = 1.0
 
     @field_validator("safety_max_dial_ratio")
     @classmethod

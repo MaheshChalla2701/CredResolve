@@ -19,6 +19,7 @@ from app.core.config import get_settings
 from app.core.enums import CircuitBreakerState
 from app.core.logging import get_logger
 from app.core.metrics import circuit_breaker_state as cb_metric, provider_requests
+from app.core.timeutils import as_utc
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,24 @@ _settings = get_settings()
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def provider_health_factor(snapshot: dict) -> float:
+    """Map a health snapshot to a 0..1 multiplier for the predictive pacer.
+
+    OPEN → 0 (no new dials), HALF_OPEN → 0.5, CLOSED → 1.0 reduced while
+    consecutive failures accumulate towards the breaker threshold.
+    """
+    state = snapshot.get("circuit_state")
+    if state == CircuitBreakerState.OPEN:
+        return 0.0
+    if state == CircuitBreakerState.HALF_OPEN:
+        return 0.5
+    failures = snapshot.get("consecutive_failures") or 0
+    if failures <= 0:
+        return 1.0
+    threshold = max(1, _settings.circuit_breaker_failure_threshold)
+    return max(0.25, 1.0 - failures / threshold)
 
 
 class ProviderHealthService:
@@ -128,13 +147,23 @@ class ProviderHealthService:
         """If OPEN and cooldown has elapsed, transition to HALF_OPEN. Returns True if transitioned."""
         from app.persistence.repositories import ProviderHealthRepository
         repo = ProviderHealthRepository(session)
-        record = await repo.get_for_update(self.provider_id)
+        cooldown = timedelta(seconds=_settings.circuit_breaker_cooldown_seconds)
 
+        # Unlocked check first: the Safety Controller calls this on every dial,
+        # and locking the row each time would serialize all dialing cycles for
+        # the provider (and the dispatch worker's health updates) behind it.
+        current = await repo.get_or_create(self.provider_id)
+        await session.refresh(current)
+        if current.circuit_state != CircuitBreakerState.OPEN or not (
+            current.circuit_opened_at and (_utcnow() - as_utc(current.circuit_opened_at)) >= cooldown
+        ):
+            return False
+
+        record = await repo.get_for_update(self.provider_id)
         if record.circuit_state != CircuitBreakerState.OPEN:
             return False
 
-        cooldown = timedelta(seconds=_settings.circuit_breaker_cooldown_seconds)
-        if record.circuit_opened_at and (_utcnow() - record.circuit_opened_at) >= cooldown:
+        if record.circuit_opened_at and (_utcnow() - as_utc(record.circuit_opened_at)) >= cooldown:
             record.circuit_state = CircuitBreakerState.HALF_OPEN
             record.half_open_probes_sent = 0
             record.updated_at = _utcnow()
@@ -146,7 +175,11 @@ class ProviderHealthService:
         return False
 
     async def get_snapshot(self, session: "AsyncSession") -> dict:
+        """Current health. Also applies the OPEN → HALF_OPEN cooldown transition, so
+        callers that only read the snapshot (the Safety Controller) still see the
+        breaker recover."""
         from app.persistence.repositories import ProviderHealthRepository
+        await self.maybe_transition_to_half_open(session)
         repo = ProviderHealthRepository(session)
         record = await repo.get_or_create(self.provider_id)
         total = max(1, record.total_requests)

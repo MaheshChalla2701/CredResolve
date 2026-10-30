@@ -1,13 +1,15 @@
 """Calls and borrower API endpoints."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.webhook_auth import verify_provider_webhook
 from app.persistence.database import get_async_db
 from app.persistence.models import Borrower
 from app.persistence.repositories import BorrowerRepository, CallRepository
+from app.workers.runtime import DialerRuntime, get_runtime
 
 router = APIRouter()
 
@@ -109,11 +111,17 @@ async def get_call(
     call_id: str,
     session: AsyncSession = Depends(get_db),
 ):
+    from app.persistence.repositories import DispatchRepository
+
     repo = CallRepository(session)
     call = await repo.get(call_id)
     if call is None:
         raise HTTPException(status_code=404, detail="Call not found")
+    dispatch = await DispatchRepository(session).get_by_call_id(call_id)
     return {
+        "dispatch_status": dispatch.status if dispatch else None,
+        "dispatch_result_code": dispatch.result_code if dispatch else None,
+        "dispatch_attempts": dispatch.attempt_count if dispatch else None,
         "id": call.id,
         "state": call.state,
         "campaign_id": call.campaign_id,
@@ -135,6 +143,7 @@ async def get_call(
 
 @router.post("/provider-events")
 async def receive_provider_event(
+    request: Request,
     provider_id: str,
     provider_event_id: str,
     provider_call_id: str,
@@ -142,26 +151,36 @@ async def receive_provider_event(
     payload: dict = None,
     session: AsyncSession = Depends(get_db),
 ):
-    """Receive a provider webhook event and process it idempotently."""
+    """Receive a provider webhook event and process it idempotently.
+
+    Authenticated with a per-provider HMAC signature when
+    PROVIDER_WEBHOOK_SECRETS is set (see app/api/webhook_auth.py).
+    """
+    from app.persistence.retry import run_transaction
     from app.services.event_processor import EventProcessor
+
+    await verify_provider_webhook(request, provider_id)
     processor = EventProcessor()
-    changed = await processor.process_raw(
-        session,
-        provider_id=provider_id,
-        provider_event_id=provider_event_id,
-        provider_call_id=provider_call_id,
-        event_type=event_type,
-        payload=payload or {},
-    )
+
+    async def process(s: AsyncSession) -> bool:
+        return await processor.process_raw(
+            s,
+            provider_id=provider_id,
+            provider_event_id=provider_event_id,
+            provider_call_id=provider_call_id,
+            event_type=event_type,
+            payload=payload or {},
+        )
+
+    changed = await run_transaction(session, process, op="provider_webhook")
     return {"processed": True, "state_changed": changed}
 
 
 @router.post("/reconcile")
 async def run_reconciliation(
     session: AsyncSession = Depends(get_db),
+    runtime: DialerRuntime = Depends(get_runtime),
 ):
-    """Trigger reconciliation manually (normally runs on a schedule)."""
-    from app.services.reconciliation import ReconciliationService
-    svc = ReconciliationService()
-    results = await svc.run(session)
+    """Trigger reconciliation manually (it also runs periodically in the background)."""
+    results = await runtime.reconciler.run(session)
     return results

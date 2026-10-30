@@ -124,6 +124,22 @@ async def check_database_health() -> bool:
         return False
 
 
+async def check_schema_ready() -> str | None:
+    """Return None if the schema exists, otherwise a short description of the problem."""
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1 FROM campaigns LIMIT 1"))
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}".splitlines()[0]
+
+
+def describe_database_url(url: str) -> str:
+    """Database URL without credentials, for logs."""
+    from sqlalchemy.engine import make_url
+    return make_url(url).render_as_string(hide_password=True)
+
+
 def override_engines(sync_url: str, async_url: str) -> None:
     """Replace engines — used in tests to point at the test database."""
     global sync_engine, async_engine  # noqa: PLW0603

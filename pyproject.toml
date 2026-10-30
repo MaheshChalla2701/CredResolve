@@ -13,8 +13,10 @@ dependencies = [
     # Web framework
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
-    # Database
-    "sqlalchemy>=2.0.36",
+    # Database — the [asyncio] extra pulls in greenlet, which SQLAlchemy's
+    # async engine requires (SQLAlchemy 2.1 no longer installs it implicitly).
+    "sqlalchemy[asyncio]>=2.0.36,<2.2",
+    "greenlet>=3.0.3",
     "alembic>=1.14.0",
     "psycopg[binary]>=3.2.3",
     "asyncpg>=0.30.0",
@@ -31,6 +33,8 @@ dependencies = [
     "python-ulid>=3.0.0",
     "tabulate>=0.9.0",
     "aiosqlite>=0.20.0",
+    # Synthetic fixture data for the simulation engine (used by /simulation/run)
+    "faker>=33.1.0",
 ]
 
 [project.optional-dependencies]

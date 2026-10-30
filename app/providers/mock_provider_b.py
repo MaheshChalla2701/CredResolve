@@ -56,8 +56,13 @@ class MockProviderB(ProviderAdapter):
         failure_burst_size: int = 0,         # 0 = no burst; N = fail N consecutive
         event_queue: asyncio.Queue | None = None,
         simulate_outage: bool = False,
+        delay_scale: float = 1.0,
+        provider_id: str | None = None,
     ) -> None:
         self._rng = random.Random(seed)
+        # Multiplier on every simulated delay (latency and event timing)
+        self.delay_scale = delay_scale
+        self._provider_id = provider_id or self.PROVIDER_ID
         self.success_rate = success_rate
         self.timeout_rate = timeout_rate
         self.min_latency_ms = min_latency_ms
@@ -84,9 +89,24 @@ class MockProviderB(ProviderAdapter):
         self._total = 0
         self._failures = 0
 
+        # Event-delivery tasks, cancelled on aclose()
+        self._background: set[asyncio.Task] = set()
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
+
+    async def aclose(self) -> None:
+        tasks = list(self._background)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     @property
     def provider_id(self) -> str:
-        return self.PROVIDER_ID
+        return self._provider_id
 
     @property
     def event_queue(self) -> asyncio.Queue[ProviderEvent]:
@@ -117,7 +137,7 @@ class MockProviderB(ProviderAdapter):
 
         # Simulate network latency (higher than Provider A)
         latency = self._rng.uniform(self.min_latency_ms, self.max_latency_ms) / 1000
-        await asyncio.sleep(latency)
+        await asyncio.sleep(latency * self.delay_scale)
 
         # Failure burst
         if self._failure_burst_remaining > 0:
@@ -147,9 +167,7 @@ class MockProviderB(ProviderAdapter):
         self._idempotency[request.idempotency_key] = provider_call_id
         self._active_calls[provider_call_id] = {"call_id": request.call_id}
 
-        asyncio.create_task(
-            self._deliver_call_events_chaotic(request.call_id, provider_call_id)
-        )
+        self._spawn(self._deliver_call_events_chaotic(request.call_id, provider_call_id))
 
         return ProviderCallResponse(accepted=True, provider_call_id=provider_call_id)
 
@@ -159,13 +177,13 @@ class MockProviderB(ProviderAdapter):
         """Deliver an event, optionally with an extra delay and/or duplicate."""
         if self._rng.random() < self.delayed_event_prob:
             delay = self._rng.uniform(0.1, self.max_extra_delay_seconds)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(delay * self.delay_scale)
 
         await self._event_queue.put(event)
 
         # Optionally duplicate
         if self._rng.random() < self.duplicate_event_prob:
-            await asyncio.sleep(self._rng.uniform(0.01, 0.5))
+            await asyncio.sleep(self._rng.uniform(0.01, 0.5) * self.delay_scale)
             await self._event_queue.put(event)
             logger.debug("provider_b_duplicate_event", event_id=event.provider_event_id)
 
@@ -177,7 +195,7 @@ class MockProviderB(ProviderAdapter):
         def _event(etype: str, **extra: Any) -> ProviderEvent:
             seq[0] += 1
             return ProviderEvent(
-                provider_id=self.PROVIDER_ID,
+                provider_id=self._provider_id,
                 provider_event_id=f"{provider_call_id}-{seq[0]}",
                 provider_call_id=provider_call_id,
                 event_type=etype,
@@ -212,27 +230,30 @@ class MockProviderB(ProviderAdapter):
 
         # Deliver
         for delay, ev in events:
-            await asyncio.sleep(delay / 10)  # scaled for simulation speed
-            asyncio.create_task(self._deliver_event_maybe_duplicate(ev))
+            await asyncio.sleep(delay / 10 * self.delay_scale)  # scaled for simulation speed
+            self._spawn(self._deliver_event_maybe_duplicate(ev))
 
         self._active_calls.pop(provider_call_id, None)
 
     async def get_call_status(self, provider_call_id: str) -> ProviderEvent | None:
         if provider_call_id in self._active_calls:
             return ProviderEvent(
-                provider_id=self.PROVIDER_ID,
+                provider_id=self._provider_id,
                 provider_event_id=f"{provider_call_id}-status",
                 provider_call_id=provider_call_id,
                 event_type="ringing",
             )
         return None
 
+    async def find_call_by_idempotency_key(self, idempotency_key: str) -> str | None:
+        return self._idempotency.get(idempotency_key)
+
     async def cancel_call(self, provider_call_id: str) -> bool:
         if provider_call_id in self._active_calls:
             self._active_calls.pop(provider_call_id)
             await self._event_queue.put(
                 ProviderEvent(
-                    provider_id=self.PROVIDER_ID,
+                    provider_id=self._provider_id,
                     provider_event_id=f"{provider_call_id}-cancel",
                     provider_call_id=provider_call_id,
                     event_type="cancelled",
@@ -244,7 +265,7 @@ class MockProviderB(ProviderAdapter):
     async def health_check(self) -> ProviderHealthStatus:
         rate = 1.0 - (self._failures / max(1, self._total))
         return ProviderHealthStatus(
-            provider_id=self.PROVIDER_ID,
+            provider_id=self._provider_id,
             is_healthy=not self.simulate_outage and rate >= 0.7,
             success_rate_1min=rate,
             avg_latency_ms=(self.min_latency_ms + self.max_latency_ms) / 2,
@@ -253,7 +274,7 @@ class MockProviderB(ProviderAdapter):
 
     def normalize_event(self, raw: dict[str, Any]) -> ProviderEvent:
         return ProviderEvent(
-            provider_id=self.PROVIDER_ID,
+            provider_id=self._provider_id,
             provider_event_id=raw["event_id"],
             provider_call_id=raw["call_id"],
             event_type=raw["event_type"],

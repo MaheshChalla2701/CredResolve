@@ -12,7 +12,15 @@ from faker import Faker
 
 from app.core.enums import AgentState, BorrowerStatus
 from app.core.logging import configure_logging, get_logger
-from app.persistence.database import AsyncSessionLocal, check_database_health, override_engines
+from app.core.config import get_settings
+from app.persistence.database import (
+    AsyncSessionLocal,
+    check_database_health,
+    check_schema_ready,
+    describe_database_url,
+    get_sync_engine,
+    override_engines,
+)
 from app.persistence.models import Agent, Base, Borrower, Campaign
 
 logger = get_logger(__name__)
@@ -94,17 +102,25 @@ async def seed() -> None:
 
     print("\nDatabase successfully seeded!")
     print("\nNext steps:")
-    print("  1. Start server: py -3.13 -m uvicorn app.main:app --reload")
+    print("  1. Start server: python -m uvicorn app.main:app --port 8000")
     print("  2. Open Swagger UI: http://localhost:8000/docs")
     print("  3. Trigger dial cycles: POST /api/v1/campaigns/{id}/dial")
 
 
-async def main_async() -> None:
-    parser = argparse.ArgumentParser(description="Seed demo data")
-    parser.add_argument("--db-path", default=None, help="SQLite DB path (default: PostgreSQL or smartdialer.db fallback)")
+async def main_async() -> int:
+    parser = argparse.ArgumentParser(
+        description="Seed demo data into the database the API is configured to use (DATABASE_URL)."
+    )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="Seed a separate SQLite file instead (the API will NOT see it unless "
+             "DATABASE_URL/DATABASE_URL_ASYNC point to the same file)",
+    )
     args = parser.parse_args()
 
     configure_logging("INFO")
+    settings = get_settings()
 
     if args.db_path:
         db_file = os.path.abspath(args.db_path)
@@ -113,22 +129,26 @@ async def main_async() -> None:
         new_sync, _ = override_engines(sync_url, async_url)
         Base.metadata.create_all(bind=new_sync)
         print(f"Using SQLite database: {db_file}")
+        print("To serve this file with the API, start it with:")
+        print(f'  DATABASE_URL="{sync_url}" DATABASE_URL_ASYNC="{async_url}" uvicorn app.main:app')
     else:
-        # Check if default postgres is reachable
-        is_healthy = await check_database_health()
-        if not is_healthy:
-            db_file = os.path.abspath("smartdialer.db")
-            sync_url = f"sqlite:///{db_file}"
-            async_url = f"sqlite+aiosqlite:///{db_file}"
-            new_sync, _ = override_engines(sync_url, async_url)
-            Base.metadata.create_all(bind=new_sync)
-            print(f"PostgreSQL not reachable; fell back to SQLite: {db_file}")
+        print(f"Using configured database: {describe_database_url(settings.database_url_async)}")
+        if settings.database_url.startswith("sqlite"):
+            Base.metadata.create_all(bind=get_sync_engine())
+        if not await check_database_health():
+            print("Database is not reachable. Check DATABASE_URL in .env (see README).")
+            return 1
+        problem = await check_schema_ready()
+        if problem is not None:
+            print(f"Schema missing ({problem}). Run `alembic upgrade head` first.")
+            return 1
 
     await seed()
+    return 0
 
 
 def main() -> None:
-    asyncio.run(main_async())
+    raise SystemExit(asyncio.run(main_async()))
 
 
 if __name__ == "__main__":

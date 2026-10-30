@@ -1,11 +1,12 @@
 """Simulation API endpoints."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.persistence.database import get_async_db
+from app.workers.runtime import DialerRuntime, get_runtime
 
 router = APIRouter()
 
@@ -49,10 +50,30 @@ async def run_simulation(
 @router.post("/simulation/provider-failure")
 async def simulate_provider_failure(
     provider_id: str = "mock_provider_b",
-    failure_count: int = 10,
+    failure_count: int = Query(default=10, ge=1, le=1000),
+    session: AsyncSession = Depends(get_db),
+    runtime: DialerRuntime = Depends(get_runtime),
 ):
-    """Inject provider failures into the circuit breaker (for testing)."""
+    """Inject provider failures into the circuit breaker (for testing).
+
+    Records `failure_count` failures exactly as the dispatch worker does after a
+    failed provider request. At circuit_breaker_failure_threshold failures the
+    circuit opens: the Safety Controller then rejects dialing on this provider
+    and the predictive pacer proposes nothing, until the cooldown elapses and
+    half-open probe calls succeed. The mock provider itself is not changed.
+    """
+    health = runtime.health.get(provider_id)
+    if health is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider_id {provider_id!r}; available: {sorted(runtime.health)}",
+        )
+    for _ in range(failure_count):
+        await health.record_failure(session)
+    snapshot = await health.get_snapshot(session)
     return {
-        "message": f"Simulated {failure_count} failures on {provider_id}",
-        "note": "Use the simulation engine for full scenario testing",
+        "provider_id": provider_id,
+        "failures_injected": failure_count,
+        "circuit_state": snapshot.get("circuit_state"),
+        "provider_health": snapshot,
     }

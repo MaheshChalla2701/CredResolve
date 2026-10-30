@@ -39,6 +39,8 @@ async def run_single_simulation(
     seed: int,
     agents: int,
     borrowers: int,
+    delay_scale: float = 1.0,
+    drain_timeout: float = 60.0,
 ) -> dict[str, Any]:
     """Run a single simulation run and return metrics."""
     engine = SimulationEngine(
@@ -47,6 +49,8 @@ async def run_single_simulation(
         seed=seed,
         num_agents=agents,
         num_borrowers=borrowers,
+        delay_scale=delay_scale,
+        drain_timeout_seconds=drain_timeout,
     )
     return await engine.run()
 
@@ -61,15 +65,21 @@ def format_table(results: list[dict[str, Any]]) -> str:
         "Approved",
         "Initiated",
         "Answered",
+        "Connected",
         "Completed",
+        "Failed",
         "Abandoned",
-        "Util %",
+        "Unresolved",
+        "Talk util %",
         "Aband %",
+        "Safety A/R/X",
         "Violations",
+        "Drained",
     ]
     rows = []
     for r in results:
         m = r.get("metrics", r)
+        sd = m.get("safety_decisions", {})
         rows.append([
             r.get("scenario", "-"),
             r.get("mode", "-").upper(),
@@ -78,11 +88,16 @@ def format_table(results: list[dict[str, Any]]) -> str:
             m.get("calls_approved", 0),
             m.get("calls_initiated", 0),
             m.get("calls_answered", 0),
+            m.get("calls_connected", 0),
             m.get("calls_completed", 0),
+            m.get("calls_failed", 0),
             m.get("calls_abandoned", 0),
+            m.get("calls_unresolved", 0),
             f"{m.get('agent_utilization_pct', 0.0):.1f}%",
             f"{m.get('abandonment_rate_pct', 0.0):.2f}%",
+            f"{sd.get('APPROVE', 0)}/{sd.get('REDUCE', 0)}/{sd.get('REJECT', 0)}",
             len(m.get("invariant_violations", [])),
+            "yes" if r.get("completed") else "TIMEOUT",
         ])
     return tabulate(rows, headers=headers, tablefmt="grid")
 
@@ -108,6 +123,14 @@ async def main_async() -> int:
     parser.add_argument("--borrowers", type=int, default=100, help="Number of simulated borrowers")
     parser.add_argument("--format", default="table", choices=["table", "json"], help="Output format")
     parser.add_argument("--db-path", default="simulation.db", help="SQLite database path for standalone runs")
+    parser.add_argument(
+        "--delay-scale", type=float, default=1.0,
+        help="Multiplier on simulated provider delays (e.g. 0.1 runs ~10x faster)",
+    )
+    parser.add_argument(
+        "--drain-timeout", type=float, default=60.0,
+        help="Seconds to wait for all calls to finish after the last dialing cycle",
+    )
 
     args = parser.parse_args()
     configure_logging("WARNING")
@@ -143,9 +166,11 @@ async def main_async() -> int:
                 seed=args.seed,
                 agents=args.agents,
                 borrowers=args.borrowers,
+                delay_scale=args.delay_scale,
+                drain_timeout=args.drain_timeout,
             )
             results.append(res)
-            print(" [DONE]")
+            print(" [DONE]" if res.get("completed") else " [TIMEOUT: calls still unresolved]")
 
     print("\n" + "=" * 55 + " RESULTS " + "=" * 55 + "\n")
     if args.format == "json":
@@ -160,18 +185,37 @@ async def main_async() -> int:
         except OSError:
             pass
 
-    # Check for invariant violations
+    # A run only counts as a success if it drained (no unresolved calls) and
+    # broke no invariants.
     total_violations = sum(len(r.get("metrics", r).get("invariant_violations", [])) for r in results)
-    if total_violations > 0:
-        print(f"\n[FAILED] {total_violations} invariant violations detected!", file=sys.stderr)
+    total_unresolved = sum(r.get("metrics", r).get("calls_unresolved", 0) for r in results)
+    timed_out = [f"{r['scenario']}/{r['mode']}" for r in results if not r.get("completed")]
+    if total_violations or total_unresolved or timed_out:
+        print(
+            f"\n[FAILED] violations={total_violations} unresolved_calls={total_unresolved} "
+            f"timed_out={timed_out or 'none'}",
+            file=sys.stderr,
+        )
         return 1
 
-    print("\n[SUCCESS] All scenarios completed with 0 invariant violations!\n")
+    print("\n[SUCCESS] All scenarios drained: every call reached a final state, 0 invariant violations.\n")
     return 0
 
 
+async def _run_and_close() -> int:
+    try:
+        return await main_async()
+    finally:
+        # Close pooled connections before the event loop goes away (otherwise
+        # aiosqlite connection threads are left open until interpreter exit).
+        from app.persistence import database
+
+        await database.async_engine.dispose()
+        database.sync_engine.dispose()
+
+
 def main() -> None:
-    sys.exit(asyncio.run(main_async()))
+    sys.exit(asyncio.run(_run_and_close()))
 
 
 if __name__ == "__main__":

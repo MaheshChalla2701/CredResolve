@@ -1,13 +1,27 @@
 """Atomic Call Allocator — the ONLY component allowed to create call reservations.
 
 Implements:
-  1. SELECT ... FOR UPDATE SKIP LOCKED on agent row.
-  2. SELECT ... FOR UPDATE SKIP LOCKED on borrower row.
-  3. Atomic creation of: Call record, Agent state update,
+  1. Campaign row lock (CampaignRepository.lock_for_dialing): the campaign must
+     be ACTIVE and below max_concurrent_calls, checked inside the same
+     transaction that creates the call, so concurrent dialing cycles cannot
+     jointly exceed the cap.
+  2. SELECT ... FOR UPDATE SKIP LOCKED on agent row.
+  3. SELECT ... FOR UPDATE SKIP LOCKED on borrower row.
+  4. Atomic creation of: Call record, Agent state update,
      Borrower status update, DispatchRecord (outbox).
-  4. All written in a single database transaction.
-  5. An idempotency key is derived from campaign + borrower + attempt_number
+  5. All written in a single database transaction.
+  6. An idempotency key is derived from campaign + borrower + attempt_number
      so that duplicate allocation attempts are safe.
+
+The hard limits above hold for every caller. The policy checks that need
+provider health (circuit breaker, half-open probes) live in the Safety
+Controller; only the dialers in app/services/dialing.py call the allocator, and
+always with a count the Safety Controller approved.
+
+Trade-off of the campaign lock: allocation is serialized per campaign (not
+across campaigns). A dialing cycle holds it for a few milliseconds; a counter
+column decremented on every terminal transition would avoid the lock but must
+be kept exact on every code path that finishes a call.
 
 Why SKIP LOCKED?
   - Multiple concurrent workers compete for available agents/borrowers.
@@ -26,24 +40,28 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from app.core.config import get_settings
-from app.core.enums import AgentState, BorrowerStatus, CallState, DispatchStatus
+from app.core.enums import AgentState, CallState, DispatchStatus
 from app.core.errors import (
     AllocationError,
+    CampaignConcurrencyLimitError,
+    CampaignNotActiveError,
     NoAvailableAgentError,
     NoEligibleBorrowerError,
 )
 from app.core.logging import get_logger
 from app.core.metrics import allocation_latency, calls_approved
-from app.domain.state_machines import validate_agent_transition, validate_call_transition
+from app.domain.state_machines import validate_agent_transition
 from app.persistence.models import Call, DispatchRecord
 from app.persistence.repositories import (
     AgentRepository,
     BorrowerRepository,
     CallRepository,
+    CampaignRepository,
     DispatchRepository,
 )
 
@@ -63,6 +81,13 @@ def _make_idempotency_key(
 ) -> str:
     """Deterministic idempotency key for a logical call attempt."""
     return f"alloc:{campaign_id}:{borrower_id}:{attempt_number}"
+
+
+@dataclass
+class BatchAllocation:
+    """Calls reserved by allocate_up_to(), and why it stopped short (if it did)."""
+    calls: list["Call"] = field(default_factory=list)
+    stop_reason: str | None = None
 
 
 class CallAllocator:
@@ -89,6 +114,8 @@ class CallAllocator:
         """Reserve one agent + borrower and create a call record atomically.
 
         Raises:
+          CampaignNotActiveError: if the campaign is missing or not ACTIVE.
+          CampaignConcurrencyLimitError: if max_concurrent_calls are active.
           NoAvailableAgentError: if no AVAILABLE agent can be claimed.
           NoEligibleBorrowerError: if no QUEUED borrower is available.
           AllocationError: on any other allocation failure.
@@ -102,6 +129,9 @@ class CallAllocator:
         borrower_repo = BorrowerRepository(session)
         call_repo = CallRepository(session)
         dispatch_repo = DispatchRepository(session)
+
+        # ── Step 0: Campaign lock + hard limits (same transaction) ────────
+        await self._check_campaign_limits(session, campaign_id)
 
         # ── Step 1: Claim an AVAILABLE agent (row-level lock) ─────────────
         agent = await agent_repo.claim_available_for_update(campaign_id)
@@ -139,7 +169,15 @@ class CallAllocator:
                 f"Duplicate allocation for key {idempotency_key}"
             )
 
-        # ── Step 5: Create the Call record ────────────────────────────────
+        # ── Step 5: Mark borrower ALLOCATED (conditional on still QUEUED) ──
+        # The conditional update is the real guard on backends without row
+        # locks (SQLite); on PostgreSQL the FOR UPDATE lock already holds it.
+        if not await borrower_repo.mark_allocated(borrower.id):
+            raise AllocationError(
+                f"Borrower {borrower.id} was allocated concurrently"
+            )
+
+        # ── Step 6: Create the Call record ────────────────────────────────
         call_id = str(uuid.uuid4())
         call = Call(
             id=call_id,
@@ -155,7 +193,7 @@ class CallAllocator:
         )
         call = await call_repo.create(call)
 
-        # ── Step 6: Transition agent AVAILABLE → RESERVED ─────────────────
+        # ── Step 7: Transition agent AVAILABLE → RESERVED ─────────────────
         updated = await agent_repo.transition_state(
             agent.id,
             from_state=AgentState.AVAILABLE,
@@ -164,16 +202,14 @@ class CallAllocator:
             current_call_id=call_id,
         )
         if not updated:
+            # Undo this allocation's writes: allocate_batch stops on this error
+            # but the caller still commits the calls allocated before it.
+            await session.delete(call)
+            await session.flush()
+            await borrower_repo.undo_allocation(borrower.id)
             raise AllocationError(
-                f"Agent {agent.id} state changed concurrently; transaction will roll back"
+                f"Agent {agent.id} state changed concurrently; allocation undone"
             )
-
-        # ── Step 7: Mark borrower ALLOCATED ──────────────────────────────
-        await borrower_repo.update_status(
-            borrower.id,
-            BorrowerStatus.ALLOCATED,
-            increment_attempts=True,
-        )
 
         # ── Step 8: Write dispatch outbox record ──────────────────────────
         dispatch = DispatchRecord(
@@ -202,25 +238,52 @@ class CallAllocator:
 
         return call
 
+    async def _check_campaign_limits(self, session: "AsyncSession", campaign_id: str) -> None:
+        campaign = await CampaignRepository(session).lock_for_dialing(campaign_id)
+        if campaign is None:
+            raise CampaignNotActiveError(campaign_id)
+        active = await CallRepository(session).count_active(campaign_id)
+        if active >= campaign.max_concurrent_calls:
+            raise CampaignConcurrencyLimitError(
+                f"Campaign {campaign_id} has {active} active calls "
+                f"(max_concurrent_calls={campaign.max_concurrent_calls})"
+            )
+
+    async def allocate_up_to(
+        self,
+        session: "AsyncSession",
+        campaign_id: str,
+        count: int,
+    ) -> BatchAllocation:
+        """Allocate up to `count` calls in the caller's transaction.
+
+        Stops at the first failure and reports why, so the caller can record a
+        shortfall against the Safety Controller's approval.
+        """
+        outcome = BatchAllocation()
+        for _ in range(count):
+            try:
+                outcome.calls.append(await self.allocate_one(session, campaign_id))
+            except NoAvailableAgentError:
+                outcome.stop_reason = "NO_AVAILABLE_AGENT"
+            except NoEligibleBorrowerError:
+                outcome.stop_reason = "NO_ELIGIBLE_BORROWER"
+            except CampaignConcurrencyLimitError:
+                outcome.stop_reason = "CAMPAIGN_CONCURRENCY_LIMIT"
+            except CampaignNotActiveError:
+                outcome.stop_reason = "CAMPAIGN_NOT_ACTIVE"
+            except AllocationError as exc:
+                logger.warning("allocation_skipped", reason=str(exc))
+                outcome.stop_reason = "ALLOCATION_CONFLICT"
+            if outcome.stop_reason:
+                break
+        return outcome
+
     async def allocate_batch(
         self,
         session: "AsyncSession",
         campaign_id: str,
         count: int,
     ) -> list["Call"]:
-        """Allocate up to `count` calls. Returns fewer if capacity runs out.
-
-        Each allocation is attempted in sequence within the same session/transaction.
-        Stops at the first NoAvailable* error (capacity exhausted).
-        """
-        calls = []
-        for _ in range(count):
-            try:
-                call = await self.allocate_one(session, campaign_id)
-                calls.append(call)
-            except (NoAvailableAgentError, NoEligibleBorrowerError):
-                break
-            except AllocationError as exc:
-                logger.warning("allocation_skipped", reason=str(exc))
-                break
-        return calls
+        """Allocate up to `count` calls. Returns fewer if capacity runs out."""
+        return (await self.allocate_up_to(session, campaign_id, count)).calls

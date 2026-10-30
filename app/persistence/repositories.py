@@ -59,6 +59,30 @@ class CampaignRepository:
             .values(status=status, updated_at=_utcnow())
         )
 
+    async def lock_for_dialing(self, campaign_id: str) -> Campaign | None:
+        """Serialize call allocation for one campaign until this transaction ends.
+
+        A write to the campaign row: on PostgreSQL it takes the row lock, so a
+        concurrent dialing transaction for the same campaign waits here; on
+        SQLite it takes the database write lock. Reads made after this (active
+        call count, agent capacity) therefore cannot be invalidated by another
+        allocation before commit. Returns the fresh campaign, or None if it is
+        missing or not ACTIVE (no lock is held then — nothing may be allocated).
+        """
+        result = await self._s.execute(
+            update(Campaign)
+            .where(Campaign.id == campaign_id, Campaign.status == "ACTIVE")
+            .values(updated_at=_utcnow())
+        )
+        if result.rowcount != 1:
+            return None
+        fresh = await self._s.execute(
+            select(Campaign)
+            .where(Campaign.id == campaign_id)
+            .execution_options(populate_existing=True)
+        )
+        return fresh.scalar_one()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Agent repository
@@ -71,8 +95,13 @@ class AgentRepository:
         return await self._s.get(Agent, agent_id)
 
     async def get_for_update(self, agent_id: str) -> Agent | None:
+        # populate_existing: refresh an already-loaded instance with the row we
+        # just locked, otherwise the session would hand back stale attributes.
         result = await self._s.execute(
-            select(Agent).where(Agent.id == agent_id).with_for_update()
+            select(Agent)
+            .where(Agent.id == agent_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -186,27 +215,38 @@ class BorrowerRepository:
     async def get(self, borrower_id: str) -> Borrower | None:
         return await self._s.get(Borrower, borrower_id)
 
+    @staticmethod
+    def _eligible(campaign_id: str) -> list:
+        now = _utcnow()
+        return [
+            Borrower.campaign_id == campaign_id,
+            Borrower.status == BorrowerStatus.QUEUED,
+            Borrower.is_dnc.is_(False),
+            or_(
+                Borrower.next_eligible_at.is_(None),
+                Borrower.next_eligible_at <= now,
+            ),
+        ]
+
     async def claim_queued_for_update(
         self, campaign_id: str
     ) -> Borrower | None:
         """Claim the highest-priority QUEUED eligible borrower with a row lock."""
-        now = _utcnow()
         result = await self._s.execute(
             select(Borrower)
-            .where(
-                Borrower.campaign_id == campaign_id,
-                Borrower.status == BorrowerStatus.QUEUED,
-                Borrower.is_dnc.is_(False),
-                or_(
-                    Borrower.next_eligible_at.is_(None),
-                    Borrower.next_eligible_at <= now,
-                ),
-            )
+            .where(*self._eligible(campaign_id))
             .order_by(Borrower.priority.desc(), Borrower.created_at.asc())
             .with_for_update(skip_locked=True)
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def count_eligible(self, campaign_id: str) -> int:
+        """Borrowers claim_queued_for_update() could hand out right now."""
+        result = await self._s.execute(
+            select(func.count(Borrower.id)).where(*self._eligible(campaign_id))
+        )
+        return result.scalar_one() or 0
 
     async def update_status(
         self,
@@ -224,6 +264,45 @@ class BorrowerRepository:
         await self._s.execute(
             update(Borrower).where(Borrower.id == borrower_id).values(**values)
         )
+
+    async def mark_allocated(self, borrower_id: str) -> bool:
+        """Conditional QUEUED -> ALLOCATED (+1 attempt). False if no longer QUEUED."""
+        result = await self._s.execute(
+            update(Borrower)
+            .where(Borrower.id == borrower_id, Borrower.status == BorrowerStatus.QUEUED)
+            .values(
+                status=BorrowerStatus.ALLOCATED,
+                attempt_count=Borrower.attempt_count + 1,
+                updated_at=_utcnow(),
+            )
+        )
+        return result.rowcount == 1
+
+    async def undo_allocation(self, borrower_id: str) -> None:
+        """Compensate a mark_allocated() whose surrounding allocation failed."""
+        await self._s.execute(
+            update(Borrower)
+            .where(Borrower.id == borrower_id, Borrower.status == BorrowerStatus.ALLOCATED)
+            .values(
+                status=BorrowerStatus.QUEUED,
+                attempt_count=Borrower.attempt_count - 1,
+                updated_at=_utcnow(),
+            )
+        )
+
+    async def settle_allocation(
+        self, borrower_id: str, status: str, *, next_eligible_at: datetime | None = None
+    ) -> bool:
+        """Conditional ALLOCATED -> status. False if the borrower was already settled."""
+        values: dict = {"status": status, "updated_at": _utcnow()}
+        if next_eligible_at is not None:
+            values["next_eligible_at"] = next_eligible_at
+        result = await self._s.execute(
+            update(Borrower)
+            .where(Borrower.id == borrower_id, Borrower.status == BorrowerStatus.ALLOCATED)
+            .values(**values)
+        )
+        return result.rowcount == 1
 
     async def create(self, borrower: Borrower) -> Borrower:
         self._s.add(borrower)
@@ -253,7 +332,10 @@ class CallRepository:
 
     async def get_for_update(self, call_id: str) -> Call | None:
         result = await self._s.execute(
-            select(Call).where(Call.id == call_id).with_for_update()
+            select(Call)
+            .where(Call.id == call_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -333,6 +415,20 @@ class CallRepository:
         )
         return result.scalars().all()
 
+    async def list_stale_in_progress(self, cutoff: datetime) -> Sequence[Call]:
+        """Provider-side calls (INITIATED..CONNECTED) with no state change since cutoff."""
+        result = await self._s.execute(
+            select(Call).where(
+                Call.state.in_([
+                    CallState.INITIATED, CallState.RINGING,
+                    CallState.ANSWERED, CallState.CONNECTED,
+                ]),
+                Call.is_ambiguous.is_(False),
+                Call.updated_at < cutoff,
+            )
+        )
+        return result.scalars().all()
+
     async def create(self, call: Call) -> Call:
         self._s.add(call)
         await self._s.flush()
@@ -363,34 +459,96 @@ class DispatchRepository:
         return record
 
     async def claim_pending(
-        self, worker_id: str, lease_seconds: int = 30, batch_size: int = 10
+        self,
+        worker_id: str,
+        lease_seconds: int = 30,
+        batch_size: int = 10,
+        *,
+        provider_id: str | None = None,
     ) -> Sequence[DispatchRecord]:
-        """Claim pending (or expired-lease) dispatch records atomically."""
-        now = _utcnow()
+        """Claim PENDING (or expired-lease CLAIMED) dispatch records, oldest first.
+
+        Candidates are selected with FOR UPDATE SKIP LOCKED (PostgreSQL), then each
+        one is claimed with a conditional UPDATE, so the claim is a compare-and-set
+        on every backend (SQLite ignores FOR UPDATE).
+
+        Only CLAIMED records are reclaimable. The worker commits call INITIATED and
+        dispatch SENT *before* contacting the provider, so a record still CLAIMED
+        proves the provider was never called and re-dispatching cannot duplicate it.
+        """
         from datetime import timedelta
+
+        now = _utcnow()
         lease_expires = now + timedelta(seconds=lease_seconds)
+        claimable = or_(
+            DispatchRecord.status == DispatchStatus.PENDING,
+            and_(
+                DispatchRecord.status == DispatchStatus.CLAIMED,
+                DispatchRecord.lease_expires_at < now,
+            ),
+        )
+        conditions = [claimable]
+        if provider_id is not None:
+            conditions.append(DispatchRecord.provider_id == provider_id)
 
         result = await self._s.execute(
-            select(DispatchRecord)
-            .where(
-                or_(
-                    DispatchRecord.status == DispatchStatus.PENDING,
-                    and_(
-                        DispatchRecord.status == DispatchStatus.CLAIMED,
-                        DispatchRecord.lease_expires_at < now,
-                    ),
-                )
-            )
+            select(DispatchRecord.id)
+            .where(*conditions)
+            .order_by(DispatchRecord.created_at)
             .with_for_update(skip_locked=True)
             .limit(batch_size)
         )
-        records = list(result.scalars().all())
-        for r in records:
-            r.status = DispatchStatus.CLAIMED
-            r.worker_id = worker_id
-            r.lease_expires_at = lease_expires
-        await self._s.flush()
-        return records
+        claimed_ids = []
+        for record_id in result.scalars().all():
+            claimed = await self._s.execute(
+                update(DispatchRecord)
+                .where(DispatchRecord.id == record_id, claimable)
+                .values(
+                    status=DispatchStatus.CLAIMED,
+                    worker_id=worker_id,
+                    lease_expires_at=lease_expires,
+                    updated_at=now,
+                )
+            )
+            if claimed.rowcount == 1:
+                claimed_ids.append(record_id)
+
+        if not claimed_ids:
+            return []
+        records = await self._s.execute(
+            select(DispatchRecord)
+            .where(DispatchRecord.id.in_(claimed_ids))
+            .order_by(DispatchRecord.created_at)
+            .execution_options(populate_existing=True)
+        )
+        return list(records.scalars().all())
+
+    async def mark_sent(self, dispatch_id: str, worker_id: str) -> bool:
+        """Fence: CLAIMED-by-me -> SENT. False if the claim was lost to another worker."""
+        result = await self._s.execute(
+            update(DispatchRecord)
+            .where(
+                DispatchRecord.id == dispatch_id,
+                DispatchRecord.status == DispatchStatus.CLAIMED,
+                DispatchRecord.worker_id == worker_id,
+            )
+            .values(
+                status=DispatchStatus.SENT,
+                attempt_count=DispatchRecord.attempt_count + 1,
+                updated_at=_utcnow(),
+            )
+        )
+        return result.rowcount == 1
+
+    async def list_lost_in_flight(self, cutoff: datetime) -> Sequence[DispatchRecord]:
+        """SENT records whose lease expired without a recorded provider outcome."""
+        result = await self._s.execute(
+            select(DispatchRecord).where(
+                DispatchRecord.status == DispatchStatus.SENT,
+                DispatchRecord.lease_expires_at < cutoff,
+            )
+        )
+        return result.scalars().all()
 
     async def update_result(
         self,
@@ -420,6 +578,17 @@ class DispatchRepository:
     async def get_by_call_id(self, call_id: str) -> DispatchRecord | None:
         result = await self._s.execute(
             select(DispatchRecord).where(DispatchRecord.call_id == call_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_call_id_for_update(self, call_id: str) -> DispatchRecord | None:
+        """Lock the call's dispatch record (take the call's lock first — see
+        app/persistence/retry.py for the lock order)."""
+        result = await self._s.execute(
+            select(DispatchRecord)
+            .where(DispatchRecord.call_id == call_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -480,6 +649,14 @@ class ProviderEventRepository:
             )
         )
 
+    async def note_unmatched(self, event_id: str) -> None:
+        """Leave the event PENDING (to be retried) but record why it is waiting."""
+        await self._s.execute(
+            update(ProviderEventInbox)
+            .where(ProviderEventInbox.id == event_id)
+            .values(processing_error="AWAITING_CALL_MATCH")
+        )
+
     async def list_pending(self, limit: int = 50) -> Sequence[ProviderEventInbox]:
         result = await self._s.execute(
             select(ProviderEventInbox)
@@ -497,25 +674,38 @@ class ProviderHealthRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._s = session
 
+    async def _ensure_row(self, provider_id: str) -> None:
+        """Create the provider's row if missing. INSERT ... ON CONFLICT DO NOTHING,
+        so two transactions seeing a new provider at the same time both succeed
+        (a plain INSERT made the second one fail on the primary key)."""
+        if self._s.get_bind().dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+        await self._s.execute(
+            insert(ProviderHealthRecord)
+            .values(provider_id=provider_id)
+            .on_conflict_do_nothing(index_elements=["provider_id"])
+        )
+
     async def get_or_create(self, provider_id: str) -> ProviderHealthRecord:
         record = await self._s.get(ProviderHealthRecord, provider_id)
         if record is None:
-            record = ProviderHealthRecord(provider_id=provider_id)
-            self._s.add(record)
-            await self._s.flush()
+            await self._ensure_row(provider_id)
+            record = await self._s.get(ProviderHealthRecord, provider_id)
         return record
 
     async def get_for_update(self, provider_id: str) -> ProviderHealthRecord:
-        result = await self._s.execute(
+        query = (
             select(ProviderHealthRecord)
             .where(ProviderHealthRecord.provider_id == provider_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        rec = result.scalar_one_or_none()
+        rec = (await self._s.execute(query)).scalar_one_or_none()
         if rec is None:
-            rec = ProviderHealthRecord(provider_id=provider_id)
-            self._s.add(rec)
-            await self._s.flush()
+            await self._ensure_row(provider_id)
+            rec = (await self._s.execute(query)).scalar_one()
         return rec
 
     async def save(self, record: ProviderHealthRecord) -> None:

@@ -1,43 +1,50 @@
 """Durable, idempotent event processor.
 
 Event processing pipeline:
-  1. Receive raw event (from provider webhook or poll).
+  1. Receive raw event (from provider webhook or the mock provider queue).
   2. Persist to provider_event_inbox — ON CONFLICT DO NOTHING (deduplication).
-  3. If duplicate → log, return immediately (no state change).
-  4. Lock the relevant call row (SELECT FOR UPDATE).
-  5. Validate transition against current call state.
-  6. Apply state transition + agent state changes atomically.
-  7. Mark inbox record as PROCESSED.
-  8. Record audit event.
+  3. If duplicate → return immediately (no state change).
+  4. Find and lock the call row (SELECT FOR UPDATE, refreshed from the database).
+  5. Work out the transition path from the current call state.
+  6. Apply the call transition(s), then the agent/borrower consequences
+     (app.services.call_outcomes) in the same transaction.
+  7. Mark the inbox record PROCESSED and write an audit event.
 
-Out-of-order handling:
-  - Each event is validated against the current call state.
-  - If the incoming event would regress a terminal state, it is silently
-    dropped (logged as out-of-order).
-  - Sequence numbers are used when available; otherwise we use state-machine
-    rules to determine applicability.
-  - A COMPLETED event arriving before ANSWERED: applied immediately.
-    If a subsequent ANSWERED event arrives, it finds state=COMPLETED and
-    is rejected by the state machine (COMPLETED has no outgoing transitions).
+Ordering rules (sequence numbers are recorded but state-machine rules decide):
+  - Skip-ahead events are applied through their implied steps, e.g. CONNECTED
+    arriving while the call is RINGING applies RINGING → ANSWERED → CONNECTED.
+  - Regressive events (RINGING after ANSWERED, ANSWERED after CONNECTED) are
+    stale: recorded in the inbox and skipped.
+  - Once a call is terminal its state never changes. A late ANSWERED/CONNECTED
+    event only back-fills the missing answered_at/connected_at timestamp so the
+    facts (e.g. "this call did connect") are not lost.
+  - An event whose provider_call_id is not recorded yet (the provider can emit
+    events before the dispatch worker commits the id) stays PENDING in the inbox
+    and is retried by the runtime (retry_unmatched).
 
-A late ANSWERED event for a COMPLETED call is recorded in the inbox
-(for auditability) but produces no state change.
+Outcome mapping:
+  completed            → call COMPLETED (borrower was reached)
+  failed / busy        → call FAILED, failure_reason = event type
+  no_answer            → call FAILED, failure_reason = "no_answer" (retryable)
+  cancelled            → call CANCELLED
 """
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+import uuid
 from typing import TYPE_CHECKING
+
+from sqlalchemy import update
 
 from app.core.enums import (
     TERMINAL_CALL_STATES,
+    VALID_CALL_TRANSITIONS,
     AgentState,
     AuditEventType,
-    BorrowerStatus,
     CallState,
     ProviderEventType,
 )
-from app.core.errors import InvalidStateTransitionError
+from app.core.errors import StaleUpdateError
 from app.core.logging import get_logger
 from app.core.metrics import (
     calls_answered,
@@ -49,17 +56,25 @@ from app.core.metrics import (
     events_out_of_order,
     events_received,
 )
-from app.domain.state_machines import is_terminal_call_state, validate_call_transition
-from app.persistence.models import AuditEvent, ProviderEventInbox
+from app.core.timeutils import utcnow
+from app.domain.state_machines import is_terminal_call_state
+from app.persistence.models import AuditEvent, Call, ProviderEventInbox
+from app.persistence.repositories import (
+    AuditRepository,
+    CallRepository,
+    ProviderEventRepository,
+)
+from app.services.call_outcomes import (
+    call_was_contacted,
+    move_agent_for_call,
+    release_agent_after_call,
+    settle_borrower,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = get_logger(__name__)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 # Map provider event types → call state transitions
@@ -70,20 +85,32 @@ _EVENT_TO_STATE: dict[str, str] = {
     ProviderEventType.COMPLETED: CallState.COMPLETED,
     ProviderEventType.FAILED: CallState.FAILED,
     ProviderEventType.CANCELLED: CallState.CANCELLED,
-    ProviderEventType.NO_ANSWER: CallState.COMPLETED,   # treat no-answer as completed
+    ProviderEventType.NO_ANSWER: CallState.FAILED,   # unanswered attempt — retryable
     ProviderEventType.BUSY: CallState.FAILED,
 }
 
-# Agent state to transition to after a call completes or fails
-def _agent_target_state_for_call_end(from_call_state: str) -> str:
-    """Determine agent state after a call ends."""
-    if from_call_state in (CallState.CONNECTED, CallState.ANSWERED):
-        return AgentState.WRAP_UP
-    elif from_call_state in (CallState.DIALING, CallState.RINGING):
-        return AgentState.WRAP_UP
-    else:
-        # Pre-dial failure — agent goes straight back to AVAILABLE
-        return AgentState.AVAILABLE
+# Events that carry no state change (the dispatch worker already set INITIATED)
+_INFORMATIONAL_EVENTS = frozenset({ProviderEventType.INITIATED})
+
+# Agent state while the call is in progress
+_AGENT_STATE_FOR_CALL: dict[str, str] = {
+    CallState.RINGING: AgentState.DIALING,
+    CallState.ANSWERED: AgentState.DIALING,
+    CallState.CONNECTED: AgentState.CONNECTED,
+}
+
+
+def _call_path(current: str, target: str) -> list[str] | None:
+    """Transition path for an event, or None if the event is stale/regressive."""
+    if (CallState(current), CallState(target)) in VALID_CALL_TRANSITIONS:
+        return [target]
+    # CONNECTED implies the call was answered: fast-forward through ANSWERED.
+    if (
+        target == CallState.CONNECTED
+        and (CallState(current), CallState.ANSWERED) in VALID_CALL_TRANSITIONS
+    ):
+        return [CallState.ANSWERED, CallState.CONNECTED]
+    return None
 
 
 class EventProcessor:
@@ -102,16 +129,14 @@ class EventProcessor:
     ) -> bool:
         """Process a raw provider event.
 
-        Returns True if the event produced a state change; False if duplicate
-        or inapplicable (out-of-order).
+        Returns True if the event produced a state change; False if duplicate,
+        stale, or still waiting for its call to be matched.
 
         This method is safe to call multiple times with the same event.
         """
         t0 = time.perf_counter()
         events_received.labels(provider=provider_id, event_type=event_type).inc()
 
-        # ── Step 1: Persist to inbox (deduplicate) ────────────────────────
-        import uuid
         inbox_entry = ProviderEventInbox(
             id=str(uuid.uuid4()),
             provider_id=provider_id,
@@ -120,13 +145,9 @@ class EventProcessor:
             event_type=event_type,
             payload=payload,
             sequence_number=sequence_number,
-            received_at=_utcnow(),
+            received_at=utcnow(),
         )
-
-        from app.persistence.repositories import ProviderEventRepository
-        event_repo = ProviderEventRepository(session)
-        inbox_entry, is_new = await event_repo.insert_if_new(inbox_entry)
-
+        inbox_entry, is_new = await ProviderEventRepository(session).insert_if_new(inbox_entry)
         if not is_new:
             events_deduplicated.labels(provider=provider_id).inc()
             logger.debug(
@@ -137,32 +158,90 @@ class EventProcessor:
             )
             return False
 
-        # ── Step 2: Find the call ─────────────────────────────────────────
-        from app.persistence.repositories import CallRepository
-        call_repo = CallRepository(session)
-        call = await call_repo.get_by_provider_call_id(provider_call_id)
+        changed = await self._apply(
+            session,
+            inbox_id=inbox_entry.id,
+            provider_id=provider_id,
+            provider_event_id=provider_event_id,
+            provider_call_id=provider_call_id,
+            event_type=event_type,
+        )
+        event_processing_latency.labels(provider=provider_id).observe(time.perf_counter() - t0)
+        return changed
 
-        if call is None:
-            logger.warning(
-                "event_no_matching_call",
+    async def retry_unmatched(
+        self,
+        session: "AsyncSession",
+        *,
+        inbox_id: str,
+        provider_id: str,
+        provider_event_id: str,
+        provider_call_id: str,
+        event_type: str,
+        give_up: bool,
+    ) -> bool:
+        """Re-apply an inbox event that arrived before its provider_call_id was
+        recorded. With give_up=True an event that still has no call is closed."""
+        found = await CallRepository(session).get_by_provider_call_id(provider_call_id)
+        if found is None:
+            if give_up:
+                logger.warning(
+                    "event_no_matching_call",
+                    provider_call_id=provider_call_id,
+                    event_type=event_type,
+                )
+                await ProviderEventRepository(session).mark_processed(
+                    inbox_id, error="NO_MATCHING_CALL"
+                )
+            return False
+        return await self._apply(
+            session,
+            inbox_id=inbox_id,
+            provider_id=provider_id,
+            provider_event_id=provider_event_id,
+            provider_call_id=provider_call_id,
+            event_type=event_type,
+        )
+
+    async def _apply(
+        self,
+        session: "AsyncSession",
+        *,
+        inbox_id: str,
+        provider_id: str,
+        provider_event_id: str,
+        provider_call_id: str,
+        event_type: str,
+    ) -> bool:
+        event_repo = ProviderEventRepository(session)
+        call_repo = CallRepository(session)
+
+        found = await call_repo.get_by_provider_call_id(provider_call_id)
+        if found is None:
+            logger.info(
+                "event_awaiting_call_match",
                 provider_call_id=provider_call_id,
                 event_type=event_type,
             )
-            await event_repo.mark_processed(
-                inbox_entry.id, error="NO_MATCHING_CALL"
-            )
+            await event_repo.note_unmatched(inbox_id)
             return False
 
-        # ── Step 3: Lock the call row ─────────────────────────────────────
-        call = await call_repo.get_for_update(call.id)
-        if call is None:
-            return False
-
+        call = await call_repo.get_for_update(found.id)
         current_state = call.state
 
-        # ── Step 4: Check if already terminal ────────────────────────────
+        if event_type in _INFORMATIONAL_EVENTS:
+            await event_repo.mark_processed(inbox_id)
+            return False
+
+        target_state = _EVENT_TO_STATE.get(event_type)
+        if target_state is None:
+            logger.warning("unknown_event_type", event_type=event_type)
+            await event_repo.mark_processed(inbox_id, error=f"UNKNOWN_EVENT_TYPE:{event_type}")
+            return False
+
         if is_terminal_call_state(current_state):
             events_out_of_order.labels(provider=provider_id).inc()
+            await self._backfill_late_facts(session, call, target_state)
             logger.info(
                 "event_dropped_terminal_call",
                 call_id=call.id,
@@ -171,228 +250,102 @@ class EventProcessor:
                 provider_event_id=provider_event_id,
             )
             await event_repo.mark_processed(
-                inbox_entry.id, error=f"CALL_ALREADY_TERMINAL:{current_state}"
+                inbox_id, error=f"CALL_ALREADY_TERMINAL:{current_state}"
             )
             return False
 
-        # ── Step 5: Map event to target state ─────────────────────────────
-        target_state = _EVENT_TO_STATE.get(event_type)
-        if target_state is None:
-            logger.warning("unknown_event_type", event_type=event_type)
-            await event_repo.mark_processed(
-                inbox_entry.id, error=f"UNKNOWN_EVENT_TYPE:{event_type}"
-            )
-            return False
-
-        # ── Step 6: Validate state-machine transition ─────────────────────
-        try:
-            validate_call_transition(current_state, target_state)
-        except InvalidStateTransitionError:
+        path = _call_path(current_state, target_state)
+        if path is None:
             events_out_of_order.labels(provider=provider_id).inc()
             logger.info(
-                "event_out_of_order",
+                "event_stale",
                 call_id=call.id,
                 current_state=current_state,
                 target_state=target_state,
                 event_type=event_type,
             )
             await event_repo.mark_processed(
-                inbox_entry.id,
-                error=f"INVALID_TRANSITION:{current_state}->{target_state}",
+                inbox_id, error=f"STALE_EVENT:{current_state}->{target_state}"
             )
             return False
+        if len(path) > 1:
+            events_out_of_order.labels(provider=provider_id).inc()
+            logger.info("event_fast_forward", call_id=call.id, path=[current_state, *path])
 
-        # ── Step 7: Build extra values for call update ────────────────────
-        extra: dict = {}
-        now = _utcnow()
-        if target_state == CallState.ANSWERED:
-            extra["answered_at"] = now
-        elif target_state == CallState.CONNECTED:
-            extra["connected_at"] = now
-        elif target_state in TERMINAL_CALL_STATES:
-            extra["completed_at"] = now
-
-        if event_type in (ProviderEventType.FAILED, ProviderEventType.BUSY):
-            extra["failure_reason"] = event_type
-
-        # ── Step 8: Apply call transition (conditional update) ────────────
-        updated = await call_repo.transition_state(
-            call.id,
-            from_state=current_state,
-            to_state=target_state,
-            version=call.state_version,
-            **extra,
-        )
-        if not updated:
-            logger.warning(
-                "call_transition_stale",
-                call_id=call.id,
-                current_state=current_state,
-                target_state=target_state,
+        # ── Apply the call transition(s) ──────────────────────────────────
+        state, version = current_state, call.state_version
+        for step in path:
+            extra: dict = {}
+            now = utcnow()
+            if step == CallState.ANSWERED:
+                extra["answered_at"] = now
+            elif step == CallState.CONNECTED:
+                extra["connected_at"] = now
+            elif step in TERMINAL_CALL_STATES:
+                extra["completed_at"] = now
+                if step != CallState.COMPLETED:
+                    extra["failure_reason"] = event_type
+            updated = await call_repo.transition_state(
+                call.id, from_state=state, to_state=step, version=version, **extra
             )
-            await event_repo.mark_processed(
-                inbox_entry.id, error="STALE_UPDATE"
-            )
-            return False
+            if not updated:
+                # We hold the row lock, so this indicates a real concurrency bug;
+                # raise so the transaction (including the inbox row) rolls back
+                # and the event can be redelivered rather than silently lost.
+                raise StaleUpdateError(f"Call {call.id} changed while locked ({state} -> {step})")
+            self._emit_metrics(call.campaign_id, step, event_type)
+            state, version = step, version + 1
 
-        # ── Step 9: Handle agent state transitions ────────────────────────
-        await self._update_agent(
-            session, call, current_state, target_state
-        )
+        # ── Agent and borrower consequences ───────────────────────────────
+        call = await call_repo.get_for_update(call.id)
+        if state in TERMINAL_CALL_STATES:
+            contacted = call_was_contacted(call, final_state=state)
+            await release_agent_after_call(session, call, contacted=contacted)
+            await settle_borrower(session, call, contacted=contacted)
+        else:
+            await move_agent_for_call(session, call, _AGENT_STATE_FOR_CALL[state])
 
-        # ── Step 10: Handle borrower re-queue on terminal ─────────────────
-        if target_state in TERMINAL_CALL_STATES:
-            await self._handle_borrower_terminal(
-                session, call, target_state, event_type
-            )
-
-        # ── Step 11: Mark inbox processed + emit metrics ──────────────────
-        await event_repo.mark_processed(inbox_entry.id)
-
-        self._emit_metrics(call.campaign_id, target_state)
-
-        # ── Step 12: Audit ────────────────────────────────────────────────
-        from app.persistence.repositories import AuditRepository
-        audit_repo = AuditRepository(session)
-        await audit_repo.log(AuditEvent(
+        await event_repo.mark_processed(inbox_id)
+        await AuditRepository(session).log(AuditEvent(
             event_type=AuditEventType.CALL_STATE_CHANGED,
             entity_type="call",
             entity_id=call.id,
             campaign_id=call.campaign_id,
             payload={
                 "from_state": current_state,
-                "to_state": target_state,
+                "to_state": state,
                 "provider_event_id": provider_event_id,
                 "event_type": event_type,
             },
         ))
-
-        elapsed = time.perf_counter() - t0
-        event_processing_latency.labels(provider=provider_id).observe(elapsed)
-
         logger.info(
             "call_state_changed",
             call_id=call.id,
             campaign_id=call.campaign_id,
             from_state=current_state,
-            to_state=target_state,
+            to_state=state,
             event_type=event_type,
         )
         return True
 
-    async def _update_agent(
-        self,
-        session: "AsyncSession",
-        call,
-        call_from: str,
-        call_to: str,
-    ) -> None:
-        """Update agent state following a call state transition."""
-        from app.persistence.repositories import AgentRepository
-        agent_repo = AgentRepository(session)
-
-        # Load agent with lock
-        agent = await agent_repo.get_for_update(call.agent_id)
-        if agent is None:
-            logger.error("event_agent_not_found", agent_id=call.agent_id)
+    @staticmethod
+    async def _backfill_late_facts(session: "AsyncSession", call: Call, target_state: str) -> None:
+        """Record a late answered/connected fact on a terminal call without
+        changing its state (only fills timestamps that are still empty)."""
+        column = {
+            CallState.ANSWERED: Call.answered_at,
+            CallState.CONNECTED: Call.connected_at,
+        }.get(target_state)
+        if column is None:
             return
-
-        agent_from = agent.state
-        agent_to: str | None = None
-
-        if call_to == CallState.RINGING and agent_from == AgentState.RESERVED:
-            agent_to = AgentState.DIALING
-        elif call_to == CallState.CONNECTED and agent_from in (
-            AgentState.DIALING, AgentState.RESERVED
-        ):
-            agent_to = AgentState.CONNECTED
-        elif call_to == CallState.ANSWERED and agent_from in (
-            AgentState.DIALING, AgentState.RESERVED
-        ):
-            # Stay in DIALING until CONNECTED; safety reservation still held
-            agent_to = AgentState.DIALING
-        elif call_to in TERMINAL_CALL_STATES:
-            if agent_from in (AgentState.CONNECTED, AgentState.DIALING, AgentState.RESERVED):
-                if call_from in (CallState.CONNECTED,):
-                    agent_to = AgentState.WRAP_UP
-                elif agent_from == AgentState.CONNECTED:
-                    agent_to = AgentState.WRAP_UP
-                else:
-                    agent_to = AgentState.WRAP_UP  # always wrap up for completed calls
-
-        if agent_to is None:
-            return
-
-        # Import validation
-        from app.domain.state_machines import VALID_AGENT_TRANSITIONS
-        if (AgentState(agent_from), AgentState(agent_to)) not in VALID_AGENT_TRANSITIONS:
-            logger.warning(
-                "agent_transition_skipped",
-                agent_id=call.agent_id,
-                from_state=agent_from,
-                to_state=agent_to,
-            )
-            return
-
-        clear_call = call_to in TERMINAL_CALL_STATES
-        updated = await agent_repo.transition_state(
-            call.agent_id,
-            from_state=agent_from,
-            to_state=agent_to,
-            version=agent.version,
-            clear_call=clear_call,
+        await session.execute(
+            update(Call)
+            .where(Call.id == call.id, column.is_(None))
+            .values({column.key: utcnow()})
         )
-        if not updated:
-            logger.warning(
-                "agent_transition_stale",
-                agent_id=call.agent_id,
-                from_state=agent_from,
-                to_state=agent_to,
-            )
-
-    async def _handle_borrower_terminal(
-        self,
-        session: "AsyncSession",
-        call,
-        terminal_state: str,
-        event_type: str,
-    ) -> None:
-        """Handle borrower status when call reaches a terminal state."""
-        from datetime import timedelta
-        from app.persistence.repositories import BorrowerRepository, CampaignRepository
-
-        borrower_repo = BorrowerRepository(session)
-        campaign_repo = CampaignRepository(session)
-
-        borrower = await borrower_repo.get(call.borrower_id)
-        if borrower is None:
-            return
-
-        campaign = await campaign_repo.get(call.campaign_id)
-        retry_cooldown = (
-            campaign.retry_cooldown_seconds if campaign else _settings.borrower_retry_cooldown_seconds
-        )
-        max_attempts = (
-            campaign.max_attempts_per_borrower if campaign else _settings.max_attempts_per_borrower
-        )
-
-        if terminal_state == CallState.COMPLETED:
-            # Successfully completed — mark borrower done
-            await borrower_repo.update_status(borrower.id, BorrowerStatus.COMPLETED)
-        elif borrower.attempt_count >= max_attempts:
-            # Exhausted attempts
-            await borrower_repo.update_status(borrower.id, BorrowerStatus.EXHAUSTED)
-        else:
-            # Failed / cancelled — requeue with cooldown
-            next_eligible = _utcnow() + timedelta(seconds=retry_cooldown)
-            await borrower_repo.update_status(
-                borrower.id,
-                BorrowerStatus.QUEUED,
-                next_eligible_at=next_eligible,
-            )
 
     @staticmethod
-    def _emit_metrics(campaign_id: str, state: str) -> None:
+    def _emit_metrics(campaign_id: str, state: str, event_type: str) -> None:
         if state == CallState.ANSWERED:
             calls_answered.labels(campaign_id=campaign_id).inc()
         elif state == CallState.CONNECTED:
@@ -400,4 +353,4 @@ class EventProcessor:
         elif state == CallState.COMPLETED:
             calls_completed.labels(campaign_id=campaign_id).inc()
         elif state == CallState.FAILED:
-            calls_failed.labels(campaign_id=campaign_id, reason="provider_event").inc()
+            calls_failed.labels(campaign_id=campaign_id, reason=event_type).inc()

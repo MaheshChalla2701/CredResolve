@@ -4,9 +4,11 @@ Policy: exactly one outbound attempt per available agent slot.
 No over-dialing. No predictions. Agents must be AVAILABLE before dialing.
 
 The progressive dialer:
-  1. Asks the Safety Controller how many calls can be placed.
-  2. Runs the Atomic Allocator up to that many times.
-  3. Returns the set of allocated Call records.
+  1. Proposes min(available agents, eligible borrowers, max_batch).
+  2. Asks the Safety Controller how many calls can be placed.
+  3. Runs the Atomic Allocator up to that many times.
+  4. Records the allocated count on the safety decision.
+  5. Returns the set of allocated Call records.
 
 It does NOT:
   - Call providers directly.
@@ -33,10 +35,10 @@ logger = get_logger(__name__)
 class ProgressiveDialer:
     """One-call-per-available-agent deterministic dialer.
 
-    Invariant: approved_count <= number of AVAILABLE agents at the time
-    of the safety check. The safety controller re-reads DB state, so
-    concurrent allocations between the check and the allocation will
-    cause allocate_one to find fewer available agents and stop early.
+    Invariant: allocated <= approved_count <= number of AVAILABLE agents at
+    the time of the safety check. When run through run_dialing_cycle() the
+    check and the allocation happen under the same campaign lock, so a
+    concurrent cycle cannot consume the approved capacity in between.
     """
 
     def __init__(
@@ -60,25 +62,30 @@ class ProgressiveDialer:
         Returns:
           (calls_created, safety_decision)
         """
-        from app.persistence.repositories import AgentRepository
+        from app.persistence.repositories import AgentRepository, BorrowerRepository
 
         # Count available agents to propose
         agent_repo = AgentRepository(session)
         state_counts = await agent_repo.count_by_state(campaign_id)
         from app.core.enums import AgentState
         available = state_counts.get(AgentState.AVAILABLE, 0)
+        # Never ask for more calls than there are borrowers to call.
+        eligible = await BorrowerRepository(session).count_eligible(campaign_id)
 
-        proposed = min(available, max_batch)
+        proposed = min(available, eligible, max_batch)
         calls_proposed.labels(campaign_id=campaign_id, mode="progressive").inc(proposed)
 
         if proposed == 0:
-            logger.debug("progressive_no_agents_available", campaign_id=campaign_id)
+            reason = "NO_AVAILABLE_AGENTS" if available == 0 else "NO_ELIGIBLE_BORROWERS"
+            logger.debug("progressive_nothing_to_dial", campaign_id=campaign_id, reason=reason)
+            # Nothing was proposed, so the Safety Controller is not consulted
+            # and no audit record is written (persisted=False).
             trivial = SafetyDecisionResult(
                 campaign_id=campaign_id,
                 requested_count=0,
                 approved_count=0,
                 decision=SafetyDecision.REJECT,
-                reason_codes=["NO_AVAILABLE_AGENTS"],
+                reason_codes=[reason],
             )
             return [], trivial
 
@@ -99,8 +106,12 @@ class ProgressiveDialer:
             return [], decision
 
         # Allocate — in same session/transaction
-        calls = await self._allocator.allocate_batch(
+        outcome = await self._allocator.allocate_up_to(
             session, campaign_id, decision.approved_count
+        )
+        calls = outcome.calls
+        await self._safety.record_allocation(
+            session, decision, allocated=len(calls), stop_reason=outcome.stop_reason
         )
 
         logger.info(
